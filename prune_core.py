@@ -232,6 +232,19 @@ class VectorDatabaseCleaner(ABC):
     - Delete individual collections by name
     """
 
+    def set_additional_expected_collections(self, collection_names: Set[str]) -> None:
+        """
+        Add collection names discovered from application-level references.
+
+        Some Open WebUI versions keep vector collection references in chat JSON,
+        file metadata, or memory rows. Database-specific cleaners can fold these
+        into their expected collection set to avoid deleting still-referenced
+        vector data.
+        """
+        self.additional_expected_collections = {
+            str(name) for name in collection_names if name
+        }
+
     @abstractmethod
     def count_orphaned_collections(
         self,
@@ -765,7 +778,7 @@ class PGVectorDatabaseCleaner(VectorDatabaseCleaner):
 
         try:
             orphaned_collections = self._get_orphaned_collections(
-                active_file_ids, active_kb_ids
+                active_file_ids, active_kb_ids, active_user_ids
             )
             self.session.rollback()  # Read-only transaction
             return len(orphaned_collections)
@@ -788,7 +801,7 @@ class PGVectorDatabaseCleaner(VectorDatabaseCleaner):
 
         try:
             orphaned_collections = self._get_orphaned_collections(
-                active_file_ids, active_kb_ids
+                active_file_ids, active_kb_ids, active_user_ids
             )
             self.session.rollback()
             for name in orphaned_collections:
@@ -817,7 +830,7 @@ class PGVectorDatabaseCleaner(VectorDatabaseCleaner):
 
         try:
             orphaned_collections = self._get_orphaned_collections(
-                active_file_ids, active_kb_ids
+                active_file_ids, active_kb_ids, active_user_ids
             )
 
             if not orphaned_collections:
@@ -901,10 +914,10 @@ class PGVectorDatabaseCleaner(VectorDatabaseCleaner):
                 if self.session:
                     self.session.rollback()
 
-            # PostgreSQL-specific optimization (if we have access to session)
-            # VACUUM must run in autocommit mode (outside transaction)
-            try:
-                if self.session:
+            # PostgreSQL-specific optimization (if explicitly requested).
+            # VACUUM must run in autocommit mode (outside transaction).
+            if getattr(self, "run_vacuum_after_cleanup", False):
+                try:
                     engine = self.session.get_bind()
                     raw_connection = engine.raw_connection()
                     try:
@@ -916,8 +929,8 @@ class PGVectorDatabaseCleaner(VectorDatabaseCleaner):
                         log.debug("Executed VACUUM ANALYZE on document_chunk table")
                     finally:
                         raw_connection.close()
-            except Exception as e:
-                log.warning(f"Failed to VACUUM PGVector table: {e}")
+                except Exception as e:
+                    log.warning(f"Failed to VACUUM PGVector table: {e}")
 
             total_deleted = deleted_count + orphaned_chunks_deleted
             if total_deleted > 0:
@@ -951,7 +964,10 @@ class PGVectorDatabaseCleaner(VectorDatabaseCleaner):
             return False
 
     def _get_orphaned_collections(
-        self, active_file_ids: Set[str], active_kb_ids: Set[str]
+        self,
+        active_file_ids: Set[str],
+        active_kb_ids: Set[str],
+        active_user_ids: Optional[Set[str]] = None,
     ) -> Set[str]:
         """
         Find collections that exist in PGVector but are no longer referenced.
@@ -960,7 +976,7 @@ class PGVectorDatabaseCleaner(VectorDatabaseCleaner):
         """
         try:
             expected_collections = self._build_expected_collections(
-                active_file_ids, active_kb_ids
+                active_file_ids, active_kb_ids, active_user_ids
             )
 
             # Query distinct collection names from document_chunk table
@@ -984,7 +1000,10 @@ class PGVectorDatabaseCleaner(VectorDatabaseCleaner):
             return set()
 
     def _build_expected_collections(
-        self, active_file_ids: Set[str], active_kb_ids: Set[str]
+        self,
+        active_file_ids: Set[str],
+        active_kb_ids: Set[str],
+        active_user_ids: Optional[Set[str]] = None,
     ) -> Set[str]:
         """Build set of collection names that should exist."""
         expected_collections = set()
@@ -996,6 +1015,17 @@ class PGVectorDatabaseCleaner(VectorDatabaseCleaner):
         # Knowledge base collections use the KB ID directly (same as ChromaDB)
         for kb_id in active_kb_ids:
             expected_collections.add(kb_id)
+
+        # User memory collections are active for existing users.
+        for user_id in active_user_ids or set():
+            expected_collections.add(f"user-memory-{user_id}")
+
+        # Extra references discovered from chat JSON, file metadata, and
+        # legacy memory rows. This preserves the old cleanup script's safety
+        # boundary for PGVector collection deletion.
+        expected_collections.update(
+            getattr(self, "additional_expected_collections", set())
+        )
 
         return expected_collections
 
@@ -2082,5 +2112,3 @@ def get_vector_database_cleaner(
             f"No specific cleaner for vector database type: {vector_db_type}, using no-op cleaner"
         )
         return NoOpVectorDatabaseCleaner()
-
-

@@ -225,7 +225,10 @@ async def count_inactive_users(
 
 
 async def count_old_chats(
-    days: Optional[int], exempt_archived: bool, exempt_in_folders: bool
+    days: Optional[int],
+    exempt_archived: bool,
+    exempt_in_folders: bool,
+    exempt_pinned: bool = False,
 ) -> int:
     """Count chats that would be deleted by age.
 
@@ -244,6 +247,9 @@ async def count_old_chats(
 
             if exempt_archived:
                 conditions.append(or_(Chat.archived == False, Chat.archived == None))
+
+            if exempt_pinned and hasattr(Chat, 'pinned'):
+                conditions.append(or_(Chat.pinned == False, Chat.pinned == None))
 
             if exempt_in_folders:
                 folder_conditions = []
@@ -653,6 +659,42 @@ async def get_active_file_ids(knowledge_bases=None, active_user_ids=None) -> Set
             else:
                 raise  # Transient DB errors must abort, not produce incomplete sets
 
+        # Scan legacy knowledge.data file_ids. Older or partially migrated
+        # databases can still have file references here even when the
+        # knowledge_file junction table is incomplete.
+        if hasattr(Knowledge, 'data'):
+            async def scan_knowledge_data():
+                kb_count = 0
+                async with get_async_db() as db:
+                    async for kb_id, data_dict in stream_rows(
+                        db, Knowledge.id, Knowledge.data, batch_size=100
+                    ):
+                        kb_id_str = str(kb_id) if kb_id else None
+                        if kb_id_str not in active_kb_ids:
+                            continue
+                        kb_count += 1
+                        if data_dict and isinstance(data_dict, dict):
+                            try:
+                                collect_file_ids_from_dict(
+                                    data_dict, active_file_ids, all_file_ids
+                                )
+                            except Exception as e:
+                                log.debug(
+                                    f"Error processing knowledge {kb_id} data: {e}"
+                                )
+                return kb_count
+
+            try:
+                kb_count = await retry_on_db_lock(scan_knowledge_data)
+                log.debug(
+                    f"Scanned {kb_count} knowledge.data rows for file references"
+                )
+            except _TABLE_MISSING_ERRORS as e:
+                if _is_table_missing_error(e):
+                    log.debug(f"Knowledge data scan skipped: {e}")
+                else:
+                    raise
+
         # Scan chat_file junction table (cheap — just UUIDs, no JSONB).
         # Since v0.6.41+ chat files are stored in a dedicated junction table.
         # Use fetchmany (not stream_rows) because chat_file.file_id is
@@ -820,6 +862,132 @@ async def get_active_file_ids(knowledge_bases=None, active_user_ids=None) -> Set
 
     log.info(f"Found {len(active_file_ids)} active file IDs")
     return active_file_ids
+
+
+def _collect_collection_names_from_dict(obj, out: Set[str], _depth: int = 0) -> None:
+    """Collect vector collection names from chat/folder style JSON blobs."""
+    if _depth > 100:
+        return
+
+    if isinstance(obj, dict):
+        collection_name = obj.get("collection_name")
+        if isinstance(collection_name, str) and collection_name:
+            out.add(collection_name)
+
+        if obj.get("type") == "collection":
+            collection_id = obj.get("id")
+            if isinstance(collection_id, str) and collection_id:
+                out.add(collection_id)
+
+        for value in obj.values():
+            _collect_collection_names_from_dict(value, out, _depth + 1)
+
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_collection_names_from_dict(item, out, _depth + 1)
+
+
+async def get_additional_vector_collection_names(
+    active_file_ids: Optional[Set[str]] = None,
+) -> Set[str]:
+    """
+    Find application-level PGVector collection references not derivable from
+    active file and knowledge IDs alone.
+
+    This mirrors the old cleanup script's preservation sources:
+    - chat JSON collection_name fields
+    - chat files with type == "collection"
+    - file.meta.collection_name for active files
+    - memory rows mapped to user-memory-{user_id}
+    """
+    collection_names: Set[str] = set()
+    normalized_active_file_ids = (
+        {str(file_id) for file_id in active_file_ids}
+        if active_file_ids is not None
+        else None
+    )
+
+    async def scan_chats_for_collections():
+        chat_count = 0
+        async with get_async_db() as db:
+            async for chat_id, chat_dict in stream_rows(
+                db, Chat.id, Chat.chat, batch_size=50
+            ):
+                chat_count += 1
+                if not chat_dict or not isinstance(chat_dict, dict):
+                    continue
+                try:
+                    _collect_collection_names_from_dict(
+                        chat_dict, collection_names
+                    )
+                except Exception as e:
+                    log.debug(
+                        f"Error processing chat {chat_id} for collection references: {e}"
+                    )
+        return chat_count
+
+    chat_count = await retry_on_db_lock(scan_chats_for_collections)
+    log.debug(f"Scanned {chat_count} chats for vector collection references")
+
+    if hasattr(File, 'meta'):
+        async def scan_file_meta_for_collections():
+            file_count = 0
+            async with get_async_db() as db:
+                async for file_id, meta_dict in stream_rows(
+                    db, File.id, File.meta, batch_size=500
+                ):
+                    file_id_str = str(file_id)
+                    if (
+                        normalized_active_file_ids is not None
+                        and file_id_str not in normalized_active_file_ids
+                    ):
+                        continue
+                    file_count += 1
+                    if not meta_dict or not isinstance(meta_dict, dict):
+                        continue
+                    collection_name = meta_dict.get("collection_name")
+                    if isinstance(collection_name, str) and collection_name:
+                        collection_names.add(collection_name)
+            return file_count
+
+        try:
+            file_count = await retry_on_db_lock(scan_file_meta_for_collections)
+            log.debug(
+                f"Scanned {file_count} active file metadata rows for collection references"
+            )
+        except _TABLE_MISSING_ERRORS as e:
+            if _is_table_missing_error(e):
+                log.debug(f"File metadata collection scan skipped: {e}")
+            else:
+                raise
+
+    async def scan_memory_collections():
+        memory_count = 0
+        async with get_async_db() as db:
+            result = await db.execute(text("SELECT DISTINCT user_id FROM memory"))
+            while True:
+                rows = result.fetchmany(5000)
+                if not rows:
+                    break
+                for (user_id,) in rows:
+                    if user_id:
+                        collection_names.add(f"user-memory-{user_id}")
+                        memory_count += 1
+        return memory_count
+
+    try:
+        memory_count = await retry_on_db_lock(scan_memory_collections)
+        log.debug(f"Scanned {memory_count} memory rows for collection references")
+    except _TABLE_MISSING_ERRORS as e:
+        if _is_table_missing_error(e):
+            log.debug(f"Memory collection scan skipped: {e}")
+        else:
+            raise
+
+    log.info(
+        f"Found {len(collection_names)} additional referenced vector collections"
+    )
+    return collection_names
 
 
 async def safe_delete_file_by_id(file_id: str, vector_cleaner, db: Optional[AsyncSession] = None) -> bool:

@@ -114,6 +114,7 @@ Common Options:
 Age-Based Deletion:
   --days N                     Delete chats older than N days
   --exempt-archived-chats      Keep archived chats even if old
+  --exempt-pinned-chats        Keep pinned chats even if old
   --exempt-chats-in-folders    Keep organized chats
 
 User Deletion:

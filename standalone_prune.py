@@ -45,6 +45,7 @@ try:
         count_orphaned_uploads,
         count_audio_cache_files,
         get_active_file_ids,
+        get_additional_vector_collection_names,
         get_kb_user_map,
         get_all_folders,
         safe_delete_file_by_id,
@@ -147,6 +148,12 @@ Safety Features:
         help='Delete chats older than N days (based on last update time)'
     )
     parser.add_argument(
+        '--exempt-pinned-chats',
+        action='store_true',
+        default=False,
+        help='Keep pinned chats even if old'
+    )
+    parser.add_argument(
         '--exempt-archived-chats',
         action='store_true',
         default=True,
@@ -162,7 +169,7 @@ Safety Features:
         '--exempt-chats-in-folders',
         action='store_true',
         default=False,
-        help='Keep chats in folders/pinned even if old'
+        help='Keep chats in folders even if old'
     )
 
     # Inactive user deletion
@@ -389,6 +396,7 @@ def create_prune_form(args) -> PruneDataForm:
     return PruneDataForm(
         days=args.days,
         exempt_archived_chats=args.exempt_archived_chats,
+        exempt_pinned_chats=args.exempt_pinned_chats,
         exempt_chats_in_folders=args.exempt_chats_in_folders,
         delete_orphaned_chats=args.delete_orphaned_chats,
         delete_orphaned_tools=args.delete_orphaned_tools,
@@ -530,6 +538,12 @@ async def run_prune(form_data: PruneDataForm, export_preview_path: str = None):
                 if uid in active_user_ids
             }
             active_file_ids = await get_active_file_ids(active_user_ids=active_user_ids)
+            additional_collection_names = await get_additional_vector_collection_names(
+                active_file_ids
+            )
+            vector_cleaner.set_additional_expected_collections(
+                additional_collection_names
+            )
 
             orphaned_counts = await count_orphaned_records(form_data, active_file_ids, active_user_ids)
 
@@ -544,6 +558,7 @@ async def run_prune(form_data: PruneDataForm, export_preview_path: str = None):
                     form_data.days,
                     form_data.exempt_archived_chats,
                     form_data.exempt_chats_in_folders,
+                    form_data.exempt_pinned_chats,
                 ),
                 orphaned_chats=orphaned_counts["chats"],
                 orphaned_files=orphaned_counts["files"],
@@ -622,6 +637,8 @@ async def run_prune(form_data: PruneDataForm, export_preview_path: str = None):
                 conditions = Chat.updated_at < cutoff_time
                 if form_data.exempt_archived_chats:
                     conditions &= or_(Chat.archived == False, Chat.archived == None)
+                if form_data.exempt_pinned_chats and hasattr(Chat, 'pinned'):
+                    conditions &= or_(Chat.pinned == False, Chat.pinned == None)
                 if form_data.exempt_chats_in_folders:
                     if hasattr(Chat, 'folder_id'):
                         conditions &= Chat.folder_id == None
@@ -823,6 +840,12 @@ async def run_prune(form_data: PruneDataForm, export_preview_path: str = None):
         kb_map = await get_kb_user_map()
         active_kb_ids = {kb_id for kb_id, uid in kb_map.items() if uid in active_user_ids}
         active_file_ids = await get_active_file_ids(active_user_ids=active_user_ids)
+        additional_collection_names = await get_additional_vector_collection_names(
+            active_file_ids
+        )
+        vector_cleaner.set_additional_expected_collections(
+            additional_collection_names
+        )
 
         log.info("Cleaning up orphaned physical files")
 
@@ -947,6 +970,7 @@ async def async_main():
     if form_data.days is not None:
         log.info(f"  Delete chats older than: {form_data.days} days")
         log.info(f"    Exempt archived chats: {form_data.exempt_archived_chats}")
+        log.info(f"    Exempt pinned chats: {form_data.exempt_pinned_chats}")
         log.info(f"    Exempt chats in folders: {form_data.exempt_chats_in_folders}")
 
     if form_data.delete_inactive_users_days is not None:
